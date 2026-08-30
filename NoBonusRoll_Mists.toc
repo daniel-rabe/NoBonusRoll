@@ -1,0 +1,13 @@
+## Interface: 50501
+## Title: NoBonusRoll
+## Notes: Automatically passes on bonus roll prompts in the raids and difficulties you choose.
+## Author: Daniel Rabe
+## Version: 1.0.0
+## X-License: MIT
+## X-Category: Raid
+## SavedVariables: NoBonusRollDB
+## IconTexture: Interface\Icons\INV_Misc_Coin_02
+
+Core.lua
+Options.lua
+Commands.lua
