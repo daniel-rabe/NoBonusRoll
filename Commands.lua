@@ -31,16 +31,17 @@ local function Help()
     local lines = {
         { "",                          "open the options window" },
         { "on | off",                  "master switch" },
-        { "status",                    "what would happen with the current raid and difficulty" },
+        { "status",                    "what would happen where you are standing right now" },
         { "diff <name or id> [on|off]","put a difficulty on the list, e.g. " .. HL .. "/nbr diff normal on|r" },
-        { "here [pass|keep|clear]",    "rule for the raid you are in, current difficulty only" },
-        { "raid [pass|keep|clear]",    "rule for the raid you are in, every difficulty" },
-        { "rule <instance> <all|difficulty> <pass|keep|clear>", "rule for a raid you are not in" },
+        { "here [pass|keep|clear]",    "rule for the instance you are in, current difficulty only" },
+        { "raid [pass|keep|clear]",    "rule for the instance you are in, every difficulty" },
+        { "rule <instance> <all|difficulty> <pass|keep|clear>", "rule for an instance you are not in" },
         { "list",                      "show every rule" },
-        { "raids",                     "show the raids you have visited and their ids" },
+        { "raids",                     "show the instances you have visited and their ids" },
         { "invert [on|off]",           "keep only what is listed and pass on everything else" },
         { "delay <seconds>",           "wait before passing (0 - 30)" },
         { "announce [on|off]",         "chat message when a roll is passed" },
+        { "debug [on|off]",            "print every confirmation prompt the client sends" },
         { "pause [minutes]",           "stop passing for a while (no minutes = cancel the pause)" },
         { "next",                      "keep the very next bonus roll" },
         { "reset",                     "restore the default settings" },
@@ -84,10 +85,10 @@ end
 local function ListRules()
     local rules = NS:GetRuleList()
     if #rules == 0 then
-        NS:Print("No raid specific rules.")
+        NS:Print("No instance specific rules.")
         return
     end
-    NS:Print("Raid specific rules:")
+    NS:Print("Instance specific rules:")
     for _, data in ipairs(rules) do
         NS:Print("  %s (%d) - %s: %s", data.instanceName, data.instanceID,
             NS:DescribeRuleKey(data.difficultyKey),
@@ -101,7 +102,7 @@ local function ListSeen()
         seen[#seen + 1] = { id = instanceID, name = name }
     end
     if #seen == 0 then
-        NS:Print("No raids visited yet since the addon was installed.")
+        NS:Print("No instances visited yet since the addon was installed.")
         return
     end
     table.sort(seen, function(a, b) return a.name < b.name end)
@@ -129,9 +130,8 @@ local function SetDifficulty(args)
         matches[1] = asID
     else
         local needle = key:lower()
-        for _, difficultyID in ipairs(NS.DIFFICULTY_ORDER) do
-            if NS:IsKnownDifficulty(difficultyID)
-               and NS:GetDifficultyName(difficultyID):lower():find(needle, 1, true) then
+        for _, difficultyID in ipairs(NS:GetDifficultyList()) do
+            if NS:GetDifficultyName(difficultyID):lower():find(needle, 1, true) then
                 matches[#matches + 1] = difficultyID
             end
         end
@@ -142,14 +142,16 @@ local function SetDifficulty(args)
         return
     end
 
+    -- Several difficulties share a name these days ("Normal" and "Mythic" exist
+    -- for dungeons and for raids), so every match is printed with its id.
     for _, difficultyID in ipairs(matches) do
         local listed = Bool(state, not NS:IsDifficultyListed(difficultyID))
         NS:SetDifficultyListed(difficultyID, listed)
         if NS.db.mode == NS.MODE_KEEP_LISTED then
-            NS:Print("%s: bonus rolls will be %s.", NS:GetDifficultyName(difficultyID),
+            NS:Print("%s (%d): bonus rolls will be %s.", NS:GetDifficultyName(difficultyID), difficultyID,
                 listed and "|cff60ff60kept|r" or "|cffff6060passed automatically|r")
         else
-            NS:Print("%s: bonus rolls will be %s.", NS:GetDifficultyName(difficultyID),
+            NS:Print("%s (%d): bonus rolls will be %s.", NS:GetDifficultyName(difficultyID), difficultyID,
                 listed and "|cffff6060passed automatically|r" or "|cff60ff60left alone|r")
         end
     end
@@ -272,6 +274,10 @@ local function Handler(input)
         NS.db.announce = Bool(args, not NS.db.announce)
         NS:Print("Chat messages are %s.", NS.db.announce and "on" or "off")
         NS:RefreshOptions()
+
+    elseif command == "debug" then
+        NS.db.debug = Bool(args, not NS.db.debug)
+        NS:Print("Debug output is %s.", NS.db.debug and "on" or "off")
 
     elseif command == "pause" then
         local minutes = NS:Pause(args)

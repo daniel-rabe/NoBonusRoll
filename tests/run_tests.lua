@@ -38,14 +38,25 @@ local function fresh(instance)
     }
 end
 
+-- Timers queue further timers (the delayed pass queues the window safety net),
+-- so keep going until nothing is left.
+local function runTimers()
+    for _ = 1, 5 do
+        if #stubs.timers == 0 then
+            break
+        end
+        stubs.runTimers()
+    end
+end
+
 -- Fires a bonus roll prompt the way the client does and returns whether the
 -- addon passed on it.
 local function prompt(spellID, difficultyID)
     spellID = spellID or 1234
     stubs.declined = {}
-    NS:HandlePrompt(spellID, NS.BONUS_ROLL_PROMPT_TYPE, "Roll?", 20, 752, 1, difficultyID)
+    NS:HandlePrompt(spellID, NS.BONUS_ROLL_PROMPT_TYPE, "Roll?", 20, 3272, 1, difficultyID, 0, 0, 0)
     stubs.showBonusRollFrame(spellID)
-    stubs.runTimers()
+    runTimers()
     return #stubs.declined > 0
 end
 
@@ -88,19 +99,35 @@ print("closing the prompt")
 --------------------------------------------------------------------------------
 fresh()
 NS:SetDifficultyListed(14, true)
+check(prompt(9000, 14) == true, "the roll is declined through the Pass button in BonusRollFrame.PromptFrame")
+check(stubs.closedByAddon == 0, "and the client is left to close its own window")
 
-local passButton = BonusRollFrame.PassButton
-stubs.removeField(BonusRollFrame, "PassButton")
-check(prompt(9001, 14) == true, "the roll is still declined when Blizzard's Pass button is not where we expect")
-check(BonusRollFrame:IsShown() == false, "and the frame is closed through the popup API instead")
-stubs.restoreField(BonusRollFrame, "PassButton", passButton)
+-- Clients that do not take the window down on their own must not be left with
+-- a dead prompt on screen.
+fresh()
+NS:SetDifficultyListed(14, true)
+stubs.clientClosesWindow = false
+check(prompt(9001, 14) == true, "a stubborn window is still declined")
+check(BonusRollFrame:IsShown() == false, "and closed by the addon afterwards")
+check(stubs.closedByAddon == 1, "using Blizzard's own close function, not a plain Hide")
+
+-- Older layouts, and anything else that moves the button, fall back to the API.
+fresh()
+NS:SetDifficultyListed(14, true)
+local promptFrame = BonusRollFrame.PromptFrame
+stubs.removeField(BonusRollFrame, "PromptFrame")
+check(prompt(9002, 14) == true, "the roll is still declined when the Pass button is not where we expect")
+check(BonusRollFrame:IsShown() == false, "and the window is closed for us")
+stubs.restoreField(BonusRollFrame, "PromptFrame", promptFrame)
 
 -- A prompt for a different spell must not have its window closed by us.
-NS:HandlePrompt(9002, NS.BONUS_ROLL_PROMPT_TYPE, "Roll?", 20, 752, 1, 14)
+fresh()
+NS:SetDifficultyListed(14, true)
+NS:HandlePrompt(9003, NS.BONUS_ROLL_PROMPT_TYPE, "Roll?", 20, 3272, 1, 14)
 stubs.declined = {}
 stubs.showBonusRollFrame(4242)
-stubs.runTimers()
-check(#stubs.declined == 1 and stubs.declined[1] == 9002, "only the prompt we decided on is declined")
+runTimers()
+check(#stubs.declined == 1 and stubs.declined[1] == 9003, "only the prompt we decided on is declined")
 check(BonusRollFrame:IsShown() == true, "a window belonging to another prompt is left open")
 BonusRollFrame:Hide()
 
@@ -111,6 +138,48 @@ fresh({ name = "Valley of the Four Winds", instanceType = "none", difficultyID =
 check(prompt(3001, 0) == false, "world boss rolls are kept unless difficulty 0 is listed")
 NS:SetDifficultyListed(0, true)
 check(prompt(3002, 0) == true, "listing difficulty 0 covers world bosses")
+
+--------------------------------------------------------------------------------
+print("dungeons, delves and unknown difficulties")
+--------------------------------------------------------------------------------
+fresh()
+check(NS.BONUS_ROLL_PROMPT_TYPE == Enum.ConfirmationPromptUIType.BonusRoll,
+    "the prompt type comes from the enum this client actually has")
+
+local offered = {}
+for _, difficultyID in ipairs(NS:GetDifficultyList()) do
+    offered[difficultyID] = true
+end
+check(offered[0] and offered[8] and offered[16] and offered[233],
+    "the difficulty list covers the world, dungeons and current raid difficulties")
+
+fresh({ name = "Ara-Kara, City of Echoes", instanceType = "party", difficultyID = 8, instanceID = 2660 })
+stubs.fireEvent("PLAYER_ENTERING_WORLD")
+check(NS.db.seen[2660] == "Ara-Kara, City of Echoes", "dungeons are remembered like raids")
+NS:SetDifficultyListed(8, true)
+check(prompt(10001, 8) == true, "a keystone dungeon roll is passed when its difficulty is listed")
+
+-- Delves report a difficulty that GetDifficultyInfo knows nothing about, so the
+-- addon has to learn it before it can be ticked.
+fresh({ name = "Earthcrawl Mines", instanceType = "scenario", difficultyID = 208, instanceID = 2664 })
+check(NS:IsKnownDifficulty(208) == false, "the client does not know the delve difficulty")
+stubs.fireEvent("PLAYER_ENTERING_WORLD")
+check(NS.db.seen[2664] == "Earthcrawl Mines", "delves are remembered as well")
+check(NS.db.difficultyNames[208] ~= nil, "and so is the difficulty they run at")
+
+local learned = false
+for _, difficultyID in ipairs(NS:GetDifficultyList()) do
+    learned = learned or difficultyID == 208
+end
+check(learned, "a learned difficulty joins the list the options panel builds from")
+
+NS:SetDifficultyListed(208, true)
+check(prompt(10002, 208) == true, "and can be passed on like any other")
+
+fresh()
+check(NS.db.difficultyNames[208] == nil, "a reset forgets the learned difficulties again")
+NS:HandlePrompt(10003, NS.BONUS_ROLL_PROMPT_TYPE, "Roll?", 20, 3272, 1, 208, 0, 0, 0)
+check(NS.db.difficultyNames[208] ~= nil, "a prompt on its own teaches the addon a difficulty")
 
 --------------------------------------------------------------------------------
 print("per raid rules")
@@ -169,20 +238,20 @@ fresh()
 NS:SetDifficultyListed(14, true)
 stubs.declined = {}
 NS:HandlePrompt(7001, 0, "Some other confirmation", 20, nil, nil, 14)
-stubs.runTimers()
+runTimers()
 check(#stubs.declined == 0, "non bonus roll confirmations are ignored")
 
 NS.db.delay = 5
-NS:HandlePrompt(7002, NS.BONUS_ROLL_PROMPT_TYPE, "Roll?", 20, 752, 1, 14)
+NS:HandlePrompt(7002, NS.BONUS_ROLL_PROMPT_TYPE, "Roll?", 20, 3272, 1, 14)
 check(#stubs.timers == 1 and stubs.timers[1].delay == 5, "the queued timer uses the configured delay")
-stubs.runTimers()
+runTimers()
 check(#stubs.declined == 1, "the delayed pass still fires")
 
 fresh()
 NS:SetDifficultyListed(14, true)
-NS:HandlePrompt(7003, NS.BONUS_ROLL_PROMPT_TYPE, "Roll?", 20, 752, 1, 14)
+NS:HandlePrompt(7003, NS.BONUS_ROLL_PROMPT_TYPE, "Roll?", 20, 3272, 1, 14)
 stubs.fireEvent("SPELL_CONFIRMATION_TIMEOUT", 7003, NS.BONUS_ROLL_PROMPT_TYPE)
-stubs.runTimers()
+runTimers()
 check(#stubs.declined == 0, "a prompt that timed out first is not declined afterwards")
 
 --------------------------------------------------------------------------------
@@ -245,6 +314,15 @@ check(NS.db.delay == 30, "the delay is capped")
 slash("announce off")
 check(NS.db.announce == false, "/nbr announce off silences the chat message")
 
+slash("debug on")
+stubs.output = {}
+NS:HandlePrompt(11001, 0, "Some other confirmation", 20, nil, nil, 14)
+check(#stubs.output == 1, "/nbr debug on reports prompts the addon does not act on")
+slash("debug off")
+stubs.output = {}
+NS:HandlePrompt(11002, 0, "Some other confirmation", 20, nil, nil, 14)
+check(#stubs.output == 0, "/nbr debug off stops it again")
+
 slash("pause 15")
 check(select(1, NS:IsPaused()) == true, "/nbr pause pauses")
 slash("pause")
@@ -272,6 +350,9 @@ NS:SetInstanceRule(1098, NS.ALL_DIFFICULTIES, NS.RULE_KEEP)
 local ok, err = pcall(function() NS:RefreshOptions() end)
 check(ok, "the options panel refreshes without errors" .. (ok and "" or (": " .. tostring(err))))
 check(#NS:GetRuleList() == 2, "both rules show up in the list")
+
+NS:RememberDifficulty(208)
+check(pcall(function() NS:RefreshOptions() end), "a learned difficulty gets a checkbox without errors")
 
 local panel = NoBonusRollOptionsPanel
 check(panel ~= nil, "the options panel frame exists")

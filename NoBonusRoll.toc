@@ -1,8 +1,8 @@
-## Interface: 110207, 120000
+## Interface: 110207, 120000, 120100
 ## Title: NoBonusRoll
-## Notes: Automatically passes on bonus roll prompts in the raids and difficulties you choose.
+## Notes: Automatically passes on bonus roll prompts in the instances and difficulties you choose.
 ## Author: Daniel Rabe
-## Version: 1.0.0
+## Version: 1.1.0
 ## X-License: MIT
 ## X-Category: Raid
 ## SavedVariables: NoBonusRollDB

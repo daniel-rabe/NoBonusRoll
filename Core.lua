@@ -1,6 +1,8 @@
 -- NoBonusRoll - Core
 -- Watches the bonus roll confirmation prompt and passes on it automatically
--- whenever the current raid / difficulty matches the rules the player set up.
+-- whenever the current instance / difficulty matches the rules the player set
+-- up. Retail 12.x (Midnight) hands out bonus rolls in raids, dungeons, delves
+-- and out in the world, all through the same SPELL_CONFIRMATION_PROMPT event.
 
 local ADDON_NAME, NS = ...
 
@@ -16,14 +18,32 @@ NS.CHAT_PREFIX = "|cff33ff99NoBonusRoll|r: "
 local GetAddOnMetadata = (C_AddOns and C_AddOns.GetAddOnMetadata) or _G.GetAddOnMetadata
 NS.VERSION = (GetAddOnMetadata and GetAddOnMetadata(ADDON_NAME, "Version")) or "dev"
 
--- The confirmation prompt type used for bonus rolls. The name of the constant
--- moved from a LE_ global to the Enum table, so look in both places.
-NS.BONUS_ROLL_PROMPT_TYPE =
-    (Enum and Enum.SpellConfirmationPromptType and Enum.SpellConfirmationPromptType.BonusRoll)
-    or _G.LE_SPELL_CONFIRMATION_PROMPT_TYPE_BONUS_ROLL
-    or 1
+-- The confirmation prompt type used for bonus rolls. The constant kept moving:
+-- LE_SPELL_CONFIRMATION_PROMPT_TYPE_BONUS_ROLL -> Enum.SpellConfirmationPromptType
+-- -> Enum.ConfirmationPromptUIType (retail 12.x). The value has always been 1,
+-- but look the name up wherever this client keeps it.
+local function ResolveBonusRollPromptType()
+    if Enum then
+        local tables = { Enum.ConfirmationPromptUIType, Enum.SpellConfirmationPromptType }
+        for _, enum in ipairs(tables) do
+            if enum and enum.BonusRoll ~= nil then
+                return enum.BonusRoll
+            end
+        end
+    end
+    if _G.LE_SPELL_CONFIRMATION_PROMPT_TYPE_BONUS_ROLL ~= nil then
+        return _G.LE_SPELL_CONFIRMATION_PROMPT_TYPE_BONUS_ROLL
+    end
+    return 1
+end
+
+NS.BONUS_ROLL_PROMPT_TYPE = ResolveBonusRollPromptType()
 
 local After = (C_Timer and C_Timer.After) or function(_, func) func() end
+
+-- Seconds to wait for the client to take the prompt window down on its own
+-- after a pass before closing it ourselves.
+local CLOSE_GRACE = 2
 
 --------------------------------------------------------------------------------
 -- Constants
@@ -38,29 +58,47 @@ NS.MODE_KEEP_LISTED    = "KEEP_LISTED"    -- keep what matches, dismiss the rest
 -- Rules that apply to every difficulty of an instance are stored under this key.
 NS.ALL_DIFFICULTIES = "ALL"
 
--- Bonus rolls outside of an instance (world bosses) are filed under difficulty 0.
+-- Bonus rolls outside of an instance (world bosses, prey) are filed under
+-- difficulty 0.
 NS.WORLD_DIFFICULTY = 0
 
 -- Difficulties offered in the options panel, in the order they are shown.
 -- Anything the current client does not know about is skipped, so the same list
--- works on retail and on Classic.
-NS.DIFFICULTY_ORDER = { 0, 7, 17, 3, 4, 5, 6, 9, 14, 15, 16, 33, 148, 151 }
+-- works on retail and on Classic. Difficulties the client knows but this list
+-- does not (delves, anything Blizzard adds later) are picked up as they are
+-- seen, see NS:RememberDifficulty.
+NS.DIFFICULTY_ORDER = {
+    0,                          -- outdoors: world bosses, prey
+    1, 2, 23, 8, 24,            -- dungeons, mythic keystone, timewalking
+    17, 14, 15, 16,             -- the current raid difficulties
+    220, 233, 250,              -- story / flexible mythic / world raid
+    33,                         -- timewalking raid
+    7, 3, 4, 5, 6, 9, 148, 151, -- legacy raid sizes
+}
 
 NS.DIFFICULTY_FALLBACK_NAMES = {
     [0]   = "World / no instance",
+    [1]   = "Normal Dungeon",
+    [2]   = "Heroic Dungeon",
     [3]   = "10 Player",
     [4]   = "25 Player",
     [5]   = "10 Player (Heroic)",
     [6]   = "25 Player (Heroic)",
     [7]   = "Looking For Raid",
+    [8]   = "Mythic Keystone",
     [9]   = "40 Player",
     [14]  = "Normal",
     [15]  = "Heroic",
     [16]  = "Mythic",
     [17]  = "Looking For Raid",
+    [23]  = "Mythic Dungeon",
+    [24]  = "Timewalking Dungeon",
     [33]  = "Timewalking",
     [148] = "20 Player",
     [151] = "Looking For Raid (Timewalking)",
+    [220] = "Story",
+    [233] = "Mythic (flexible)",
+    [250] = "World Raid",
 }
 
 --------------------------------------------------------------------------------
@@ -83,7 +121,8 @@ function NS:GetDifficultyName(difficultyID)
     if name and name ~= "" then
         return name
     end
-    return self.DIFFICULTY_FALLBACK_NAMES[difficultyID] or ("Difficulty " .. difficultyID)
+    local learned = self.db and self.db.difficultyNames[difficultyID]
+    return learned or self.DIFFICULTY_FALLBACK_NAMES[difficultyID] or ("Difficulty " .. difficultyID)
 end
 
 -- True when the current client knows this difficulty, used to hide retail-only
@@ -96,9 +135,59 @@ function NS:IsKnownDifficulty(difficultyID)
     return name ~= nil and name ~= ""
 end
 
+-- Difficulties the player has actually been in, or that a prompt reported, are
+-- remembered so that content DIFFICULTY_ORDER does not list (delves and
+-- whatever comes next) can still be ticked in the options panel.
+function NS:RememberDifficulty(difficultyID, name)
+    difficultyID = tonumber(difficultyID)
+    if not difficultyID or difficultyID <= 0 or not self.db then
+        return
+    end
+    if not name or name == "" then
+        name = GetDifficultyInfo and GetDifficultyInfo(difficultyID)
+    end
+    if not name or name == "" then
+        name = self.DIFFICULTY_FALLBACK_NAMES[difficultyID] or ("Difficulty " .. difficultyID)
+    end
+    self.db.difficultyNames[difficultyID] = name
+end
+
+-- Every difficulty worth showing: the static order first, then anything that
+-- was learned or already has a setting, so nothing silently drops off the list.
+function NS:GetDifficultyList()
+    local list, added = {}, {}
+
+    for _, difficultyID in ipairs(self.DIFFICULTY_ORDER) do
+        if not added[difficultyID] and self:IsKnownDifficulty(difficultyID) then
+            added[difficultyID] = true
+            list[#list + 1] = difficultyID
+        end
+    end
+
+    local extra = {}
+    if self.db then
+        for _, source in ipairs({ self.db.difficultyNames, self.db.difficulties }) do
+            for difficultyID in pairs(source) do
+                difficultyID = tonumber(difficultyID)
+                if difficultyID and not added[difficultyID] then
+                    added[difficultyID] = true
+                    extra[#extra + 1] = difficultyID
+                end
+            end
+        end
+    end
+    table.sort(extra)
+
+    for _, difficultyID in ipairs(extra) do
+        list[#list + 1] = difficultyID
+    end
+
+    return list
+end
+
 function NS:DescribeInstance(instanceID)
     if not instanceID then
-        return "any raid"
+        return "any instance"
     end
     local entry = self.db and self.db.instances[instanceID]
     local name = (entry and entry.name) or (self.db and self.db.seen[instanceID])
@@ -110,14 +199,16 @@ end
 --------------------------------------------------------------------------------
 
 local defaults = {
-    enabled      = true,
-    mode         = NS.MODE_DISMISS_LISTED,
-    announce     = true,
-    delay        = 0,
-    difficulties = {}, -- [difficultyID] = true
-    instances    = {}, -- [instanceID] = { name = "...", rules = { [difficultyID or "ALL"] = "DISMISS"/"KEEP" } }
-    seen         = {}, -- [instanceID] = "name" of every raid visited, for /nbr raids
-    stats        = { dismissed = 0 },
+    enabled         = true,
+    mode            = NS.MODE_DISMISS_LISTED,
+    announce        = true,
+    debug           = false,
+    delay           = 0,
+    difficulties    = {}, -- [difficultyID] = true
+    difficultyNames = {}, -- [difficultyID] = "name" of every difficulty seen
+    instances       = {}, -- [instanceID] = { name = "...", rules = { [difficultyID or "ALL"] = "DISMISS"/"KEEP" } }
+    seen            = {}, -- [instanceID] = "name" of every instance visited, for /nbr raids
+    stats           = { dismissed = 0 },
 }
 
 local function applyDefaults(source, target)
@@ -320,6 +411,28 @@ end
 -- Dismissing
 --------------------------------------------------------------------------------
 
+-- The prompt window belongs to GroupLootContainer, so it has to be taken out
+-- of the container instead of merely hidden, or the container keeps a gap for
+-- it. Normally the client does this itself once the server acknowledges the
+-- pass; this is only the safety net.
+function NS:CloseBonusRollWindow(spellID)
+    local frame = _G.BonusRollFrame
+    if not frame or not frame:IsShown() then
+        return
+    end
+    if spellID and frame.spellID ~= nil and frame.spellID ~= spellID then
+        return -- it belongs to a different prompt by now
+    end
+
+    if _G.BonusRollFrame_CloseBonusRoll then
+        pcall(_G.BonusRollFrame_CloseBonusRoll)
+    elseif _G.StaticPopupSpecial_Hide then
+        _G.StaticPopupSpecial_Hide(frame)
+    else
+        frame:Hide()
+    end
+end
+
 function NS:DismissPrompt(spellID, ctx, reason)
     if self.pendingSpellID ~= spellID then
         return -- the prompt timed out or the player answered it first
@@ -328,27 +441,27 @@ function NS:DismissPrompt(spellID, ctx, reason)
 
     local frame = _G.BonusRollFrame
     local ours = frame and frame:IsShown() and (frame.spellID == nil or frame.spellID == spellID)
-    local handled = false
 
-    -- Clicking Blizzard's own Pass button declines the prompt and tears the
-    -- frame down exactly the way a manual pass would. It is wrapped because it
-    -- relies on frame internals, and the plain API below is the safety net.
-    if ours and frame.PassButton and frame.PassButton.Click then
-        local ok = pcall(frame.PassButton.Click, frame.PassButton)
-        handled = ok and not frame:IsShown()
+    -- Clicking Blizzard's own Pass button does exactly what a manual pass does.
+    -- The button sits in BonusRollFrame.PromptFrame on current clients and
+    -- directly on BonusRollFrame on older ones; both call the API below, which
+    -- stays as the safety net because this pokes at frame internals.
+    local passButton = ours and ((frame.PromptFrame and frame.PromptFrame.PassButton) or frame.PassButton)
+    local passed = false
+    if type(passButton) == "table" and passButton.Click then
+        passed = pcall(passButton.Click, passButton)
     end
 
-    if not handled then
-        if DeclineSpellConfirmationPrompt then
-            DeclineSpellConfirmationPrompt(spellID)
-        end
-        if frame and frame:IsShown() and (frame.spellID == nil or frame.spellID == spellID) then
-            if StaticPopupSpecial_Hide then
-                StaticPopupSpecial_Hide(frame)
-            else
-                frame:Hide()
-            end
-        end
+    if not passed and DeclineSpellConfirmationPrompt then
+        DeclineSpellConfirmationPrompt(spellID)
+    end
+
+    -- The client removes the window when the server confirms the pass. Give it
+    -- a moment and only step in if it is somehow still on screen.
+    if ours then
+        After(CLOSE_GRACE, function()
+            self:CloseBonusRollWindow(spellID)
+        end)
     end
 
     self.db.stats.dismissed = (self.db.stats.dismissed or 0) + 1
@@ -358,15 +471,27 @@ function NS:DismissPrompt(spellID, ctx, reason)
     end
 end
 
-function NS:HandlePrompt(spellID, confirmType, text, duration, currencyID, currencyCost, difficultyID)
+-- Argument list as of retail 12.x; older clients simply stop after difficultyID.
+function NS:HandlePrompt(spellID, confirmType, text, duration, currencyID, currencyCost, difficultyID, displayItemID)
+    -- /nbr debug: every spell confirmation, not just bonus rolls, so it is
+    -- possible to tell "the addon ignored it" from "the client never asked".
+    if self.db.debug then
+        self:Print("prompt: spell %s, type %s (bonus roll is %s), currency %s x%s, difficulty %s, item %s",
+            tostring(spellID), tostring(confirmType), tostring(self.BONUS_ROLL_PROMPT_TYPE),
+            tostring(currencyID), tostring(currencyCost), tostring(difficultyID), tostring(displayItemID))
+    end
+
     if confirmType ~= self.BONUS_ROLL_PROMPT_TYPE then
         return
     end
 
+    self:RememberDifficulty(difficultyID)
+
     local ctx = self:GetContext(difficultyID)
-    ctx.spellID      = spellID
-    ctx.currencyID   = currencyID
-    ctx.currencyCost = currencyCost
+    ctx.spellID       = spellID
+    ctx.currencyID    = currencyID
+    ctx.currencyCost  = currencyCost
+    ctx.displayItemID = displayItemID
 
     self.lastPrompt = ctx
 
@@ -419,10 +544,16 @@ end
 --------------------------------------------------------------------------------
 
 function NS:RememberCurrentInstance()
-    local name, instanceType, _, _, _, _, _, instanceID = GetInstanceInfo()
-    if instanceType ~= "raid" and instanceType ~= "party" then
+    local name, instanceType, difficultyID, difficultyName, _, _, _, instanceID = GetInstanceInfo()
+
+    -- "scenario" covers delves, which hand out bonus rolls just like raids and
+    -- dungeons do.
+    if instanceType ~= "raid" and instanceType ~= "party" and instanceType ~= "scenario" then
         return
     end
+
+    self:RememberDifficulty(difficultyID, difficultyName)
+
     if not instanceID or not name then
         return
     end

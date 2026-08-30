@@ -10,6 +10,8 @@ stubs.output = {}
 stubs.declined = {}
 stubs.timers = timers
 stubs.frames = frames
+stubs.closedByAddon = 0
+stubs.clientClosesWindow = true
 
 -- Current fake location, changed by the tests.
 stubs.instance = {
@@ -19,14 +21,19 @@ stubs.instance = {
     instanceID = 1136,
 }
 
+-- Roughly what a current retail client reports. Delve difficulties are left
+-- out on purpose: the addon has to cope with ids GetDifficultyInfo knows
+-- nothing about.
 local difficultyNames = {
-    [1] = "Normal", [2] = "Heroic",
+    [1] = "Normal", [2] = "Heroic", [8] = "Mythic Keystone",
     [3] = "10 Player", [4] = "25 Player",
     [5] = "10 Player (Heroic)", [6] = "25 Player (Heroic)",
     [7] = "Looking For Raid", [9] = "40 Player",
     [14] = "Normal", [15] = "Heroic", [16] = "Mythic",
-    [17] = "Looking For Raid", [33] = "Timewalking",
+    [17] = "Looking For Raid", [23] = "Mythic", [24] = "Timewalking",
+    [33] = "Timewalking",
     [148] = "20 Player", [151] = "Looking For Raid (Timewalking)",
+    [220] = "Story", [233] = "Mythic", [250] = "World",
 }
 
 --------------------------------------------------------------------------------
@@ -164,7 +171,13 @@ function stubs.install()
         end,
     }
 
-    _G.Enum = { SpellConfirmationPromptType = { SimpleWarning = 0, BonusRoll = 1, StaticPopup = 2 } }
+    -- Retail 12.x: the old SpellConfirmationPromptType enum is gone.
+    _G.Enum = {
+        ConfirmationPromptUIType = {
+            StaticText = 0, BonusRoll = 1, SimpleWarning = 2,
+            StaticTextAlert = 3, SimpleWarningAlert = 4,
+        },
+    }
 
     _G.DeclineSpellConfirmationPrompt = function(spellID)
         stubs.declined[#stubs.declined + 1] = spellID
@@ -172,13 +185,27 @@ function stubs.install()
     _G.AcceptSpellConfirmationPrompt = function() end
     _G.StaticPopupSpecial_Hide = function(frame) frame:Hide() end
 
+    -- BonusRollFrame as GroupLootFrame.xml builds it: the Pass button lives in
+    -- the PromptFrame child and only declines, the window itself is taken down
+    -- by the client when the server answers.
     _G.BonusRollFrame = newWidget("Frame", "BonusRollFrame")
     _G.BonusRollFrame:Hide()
-    _G.BonusRollFrame.PassButton = newWidget("Button", nil, _G.BonusRollFrame)
-    _G.BonusRollFrame.PassButton:SetScript("OnClick", function()
+    _G.BonusRollFrame.PromptFrame = newWidget("Frame", nil, _G.BonusRollFrame)
+    _G.BonusRollFrame.PromptFrame.PassButton = newWidget("Button", nil, _G.BonusRollFrame.PromptFrame)
+    _G.BonusRollFrame.PromptFrame.PassButton:SetScript("OnClick", function()
         _G.DeclineSpellConfirmationPrompt(_G.BonusRollFrame.spellID)
-        _G.BonusRollFrame:Hide()
+        if stubs.clientClosesWindow then
+            _G.BonusRollFrame:Hide()
+        end
     end)
+
+    -- Current clients have no PassButton directly on the frame any more.
+    stubs.removeField(_G.BonusRollFrame, "PassButton")
+
+    _G.BonusRollFrame_CloseBonusRoll = function()
+        _G.BonusRollFrame:Hide()
+        stubs.closedByAddon = (stubs.closedByAddon or 0) + 1
+    end
 
     _G.SlashCmdList = {}
     _G.InterfaceOptions_AddCategory = function() end
@@ -211,6 +238,10 @@ function stubs.reset()
     stubs.output = {}
     stubs.declined = {}
     stubs.timers = {}
+    stubs.closedByAddon = 0
+    -- Default: the client tears the window down itself, the way it does when
+    -- the server acknowledges a pass.
+    stubs.clientClosesWindow = true
     timers = stubs.timers
     _G.BonusRollFrame:Hide()
     _G.BonusRollFrame.spellID = nil
